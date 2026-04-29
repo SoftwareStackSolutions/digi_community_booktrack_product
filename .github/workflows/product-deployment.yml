@@ -25,7 +25,7 @@ jobs:
       # ✅ Package only product-service
       - name: Zip product-service
         run: |
-          cd product-service
+          cd products-service
           zip -r ../product-package.zip . -x "*.git*" "__pycache__/*"
 
       - name: Checkout Artifact Repo
