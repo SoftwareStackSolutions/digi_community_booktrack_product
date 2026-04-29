@@ -82,6 +82,19 @@ jobs:
           mv product-package.zip artifact-repo/Product/Product-${VERSION}.zip
           cp artifact-repo/Product/Product-${VERSION}.zip artifact-repo/Product/Product-latest.zip
 
+      - name: Cleanup old artifacts (keep last 5)
+        if: steps.hash.outputs.no_change == 'false'
+        run: |
+          cd artifact-repo/Product
+
+          echo "Before cleanup:"
+          ls -1 Product-v*.zip || true
+
+          ls -1 Product-v*.zip 2>/dev/null | sort -V | head -n -5 | xargs -r rm -f
+
+          echo "After cleanup:"
+          ls -1 Product-v*.zip || true
+
       - name: Commit & Push
         if: steps.hash.outputs.no_change == 'false'
         run: |
