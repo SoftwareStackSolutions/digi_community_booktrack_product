@@ -3,7 +3,7 @@ name: Product Service CI Pipeline
 on:
   push:
     branches:
-      - main
+      - development
 
 jobs:
 
