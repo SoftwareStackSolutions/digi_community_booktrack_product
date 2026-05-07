@@ -1,0 +1,313 @@
+name: Product Service CI Pipeline
+
+on:
+  push:
+    branches:
+      - acceptance
+
+jobs:
+
+# -----------------------------------------
+# 1️⃣ CHECKOUT
+# -----------------------------------------
+  checkout-source-code:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+# -----------------------------------------
+# 2️⃣ BUILD ARTIFACT + VERSIONING
+# -----------------------------------------
+  build-and-publish-artifact:
+    name: Build and Publish Artifact
+
+    runs-on: ubuntu-latest
+
+    needs: checkout-source-code
+
+    outputs:
+      version: ${{ steps.set_version.outputs.version }}
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Install zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip
+
+      # ZIP PRODUCT SERVICE
+      - name: Zip product-service
+        run: |
+          cd products-service
+
+          zip -r ../product-package.zip . \
+            -x "*.git*" "__pycache__/*"
+
+      # CHECKOUT ARTIFACT REPO
+      - name: Checkout Artifact Repo
+        uses: actions/checkout@v4
+        with:
+          repository: SoftwareStackSolutions/digi_community_booktrack_artifact
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+          path: artifact-repo
+
+      # CHECK PREVIOUS HASH
+      - name: Check previous hash
+        run: |
+          mkdir -p artifact-repo/Product
+
+          cd artifact-repo/Product
+
+          latest_file=$(ls Product-v*.zip 2>/dev/null | sort -V | tail -n 1)
+
+          if [[ -f "$latest_file" ]]; then
+            sha256sum "$latest_file" | cut -d' ' -f1 > ../../../latest_hash.txt
+          else
+            echo "no_previous_hash" > ../../../latest_hash.txt
+          fi
+
+      # CURRENT HASH
+      - name: Generate current hash
+        run: |
+          sha256sum product-package.zip | cut -d' ' -f1 > current_hash.txt
+
+      # COMPARE HASH
+      - name: Compare hash
+        id: hash
+        run: |
+          if cmp -s latest_hash.txt current_hash.txt; then
+            echo "no_change=true" >> $GITHUB_OUTPUT
+          else
+            echo "no_change=false" >> $GITHUB_OUTPUT
+          fi
+
+      # VERSION
+      - name: Generate version
+        id: set_version
+        run: |
+          cd artifact-repo/Product
+
+          count=$(ls Product-v*.zip 2>/dev/null | wc -l)
+
+          if [ "${{ steps.hash.outputs.no_change }}" = "true" ]; then
+            echo "version=latest" >> $GITHUB_OUTPUT
+          else
+            echo "version=v$((count + 1))" >> $GITHUB_OUTPUT
+          fi
+
+      # MOVE ARTIFACT
+      - name: Move artifact
+        if: steps.hash.outputs.no_change == 'false'
+        run: |
+          VERSION=${{ steps.set_version.outputs.version }}
+
+          mv product-package.zip \
+             artifact-repo/Product/Product-${VERSION}.zip
+
+          cp artifact-repo/Product/Product-${VERSION}.zip \
+             artifact-repo/Product/Product-latest.zip
+
+      # CLEANUP
+      - name: Cleanup old artifacts
+        if: steps.hash.outputs.no_change == 'false'
+        run: |
+          cd artifact-repo/Product
+
+          ls -1 Product-v*.zip 2>/dev/null | \
+          sort -V | \
+          head -n -5 | \
+          xargs -r rm -f
+
+      # COMMIT
+      - name: Commit & Push
+        if: steps.hash.outputs.no_change == 'false'
+        run: |
+          cd artifact-repo
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add Product/*.zip
+
+          git commit -m "Product Artifact ${{ steps.set_version.outputs.version }}"
+
+          git push origin main
+
+# -----------------------------------------
+# 3️⃣ BUILD & PUSH TO ECR
+# -----------------------------------------
+  container-build-and-publish:
+    name: Build & Push Docker Image
+
+    runs-on: ubuntu-latest
+
+    needs: build-and-publish-artifact
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+
+      # CHECKOUT ARTIFACT REPO
+      - name: Checkout artifact repo
+        uses: actions/checkout@v4
+        with:
+          repository: SoftwareStackSolutions/digi_community_booktrack_artifact
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+          path: artifact-repo
+
+      # COPY ARTIFACT
+      - name: Copy latest artifact
+        run: |
+          cp artifact-repo/Product/Product-latest.zip ./artifact.zip
+
+      # EXTRACT
+      - name: Extract artifact
+        run: |
+          rm -rf app
+
+          mkdir app
+
+          unzip artifact.zip -d app
+
+      # AWS LOGIN
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # ACCOUNT ID
+      - name: Get AWS Account ID
+        id: aws_account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+
+      # LOGIN ECR
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+          | docker login \
+            --username AWS \
+            --password-stdin \
+            ${{ steps.aws_account.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+      # BUILD IMAGE
+      - name: Build Docker image
+        run: |
+          docker build -t product-app ./app
+
+      # TAG IMAGE
+      - name: Tag image
+        run: |
+          VERSION=${{ needs.build-and-publish-artifact.outputs.version }}
+
+          ACCOUNT_ID=${{ steps.aws_account.outputs.account_id }}
+
+          REGION=${{ secrets.AWS_REGION }}
+
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/product-app
+
+          docker tag product-app:latest $ECR_URI:$VERSION
+          docker tag product-app:latest $ECR_URI:latest
+
+      # PUSH IMAGE
+      - name: Push image
+        run: |
+          VERSION=${{ needs.build-and-publish-artifact.outputs.version }}
+
+          ACCOUNT_ID=${{ steps.aws_account.outputs.account_id }}
+
+          REGION=${{ secrets.AWS_REGION }}
+
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/product-app
+
+          docker push $ECR_URI:$VERSION
+          docker push $ECR_URI:latest
+
+# -----------------------------------------
+# 4️⃣ DEPLOY TO EKS
+# -----------------------------------------
+  deploy-to-eks:
+    name: Deploy to EKS
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - container-build-and-publish
+      - build-and-publish-artifact
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # AWS LOGIN
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # ACCOUNT ID
+      - name: Get AWS Account ID
+        id: aws_account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+
+      # INSTALL KUBECTL
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      # UPDATE KUBECONFIG
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name ${{ secrets.ACC_EKS_CLUSTER_NAME }}
+
+      # DEPLOY
+      - name: Deploy to cluster
+        run: |
+
+          VERSION=${{ needs.build-and-publish-artifact.outputs.version }}
+
+          ACCOUNT_ID=${{ steps.aws_account.outputs.account_id }}
+
+          REGION=${{ secrets.AWS_REGION }}
+
+          IMAGE="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/product-app:$VERSION"
+
+          echo "Deploying image: $IMAGE"
+
+          kubectl apply -f secrets.yaml
+
+          kubectl apply -f product-deployment.yaml
+
+          kubectl apply -f product-service.yaml
+
+          kubectl set image deployment/product-service \
+            product-service=$IMAGE \
+            -n tracking-app
+
+          kubectl rollout status deployment/product-service -n tracking-app
+
+      # VERIFY
+      - name: Verify Pods
+        run: |
+          kubectl get pods -n tracking-app
